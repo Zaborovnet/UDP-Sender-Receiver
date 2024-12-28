@@ -1,0 +1,1341 @@
+QT       += core gui network
+
+greaterThan(QT_MAJOR_VERSION, 4): QT += widgets
+
+CONFIG += c++17
+
+# You can make your code fail to compile if it uses deprecated APIs.
+# In order to do so, uncomment the following line.
+#DEFINES += QT_DISABLE_DEPRECATED_BEFORE=0x060000    # disables all the APIs deprecated before Qt 6.0.0
+
+SOURCES += \
+    CryptoUtils.cpp \
+    ImageReceiver.cpp \
+    ImageSender.cpp \
+    ImageTransfer.cpp \
+    JpegCompressor.cpp \
+    MainWindow.cpp \
+    UdpConnection.cpp \
+    jpeg/jpgd.cpp \
+    jpeg/jpge.cpp \
+    jpeg/tga2jpg.cpp \
+    jpeg/timer.cpp \
+    main.cpp
+
+HEADERS += \
+    CryptoUtils.h \
+    ImageReceiver.h \
+    ImageSender.h \
+    ImageTransfer.h \
+    JpegCompressor.h \
+    MainWindow.h \
+    UdpConnection.h \
+    jpeg/jpgd.h \
+    jpeg/jpgd_idct.h \
+    jpeg/jpge.h \
+    jpeg/stb_image.h \
+    jpeg/stb_image_write.h \
+    jpeg/timer.h
+
+FORMS += \
+    MainWindow.ui
+
+INCLUDEPATH += /usr/include/cryptopp
+LIBS += -lcryptopp  # Добавлено для линковки с библиотекой Crypto++  sudo apt install libcrypto++-dev
+
+# Default rules for deployment.
+qnx: target.path = /tmp/$${TARGET}/bin
+else: unix:!android: target.path = /opt/$${TARGET}/bin
+!isEmpty(target.path): INSTALLS += target
+
+DISTFILES += \
+    jpeg/jpge.sln \
+    jpeg/jpge.vcxproj \
+    jpeg/jpge.vcxproj.filters
+
+
+// CryptoUtils.cpp
+
+#include "CryptoUtils.h"
+#include <iostream> // Добавлено для std::cerr
+#include <ostream>
+#include <cryptlib.h>
+#include <osrng.h>
+#include <aes.h>
+#include <filters.h>
+#include <hex.h>
+
+using namespace CryptoPP;
+
+void CryptoUtils::GenerateRSAKeys(std::string &publicKey, std::string &privateKey) {
+    AutoSeededRandomPool rng;
+
+    // Генерация ключей
+    InvertibleRSAFunction params;
+    params.GenerateRandomWithKeySize(rng, 2048);
+
+    RSA::PrivateKey privateKeyObj(params);
+    RSA::PublicKey publicKeyObj(params);
+
+    // Создание BufferedTransformation
+    StringSink privateKeySink(privateKey);
+    StringSink publicKeySink(publicKey);
+
+    // Сохранение ключей в строки
+    privateKeyObj.DEREncode(privateKeySink);
+    publicKeyObj.DEREncode(publicKeySink);
+}
+
+std::string CryptoUtils::AESEncrypt(const std::string &plainText, const std::string &key) {
+    std::string cipherText;
+    byte iv[AES::BLOCKSIZE]; // Вектор инициализации
+    AutoSeededRandomPool rng;
+    rng.GenerateBlock(iv, sizeof(iv)); // Генерация случайного IV
+
+    // Шифрование
+    try {
+        // Создание шифра
+        CBC_Mode<AES>::Encryption encryption;
+        encryption.SetKeyWithIV((byte*)key.data(), key.size(), iv);
+
+        // Формирование потока шифрования
+        StringSink cipherTextSink(cipherText);
+        cipherTextSink.Put(iv, sizeof(iv)); // Добавляем IV в начало
+
+        // Создаем фильтр
+        StreamTransformationFilter stfEncryptor(encryption, new Redirector(cipherTextSink));
+        stfEncryptor.Put((byte*)plainText.data(), plainText.size());
+        stfEncryptor.MessageEnd();
+    }
+    catch (const Exception& e) {
+        std::cerr << "Error during AES encryption: " << e.what() << std::endl;
+    }
+
+    return cipherText;
+}
+
+std::string CryptoUtils::AESDecrypt(const std::string &cipherText, const std::string &key) {
+    std::string decryptedText;
+
+    // Извлечение IV из начала зашифрованного текста
+    byte iv[AES::BLOCKSIZE];
+    memcpy(iv, cipherText.data(), AES::BLOCKSIZE);
+
+    try {
+        // Дешифрование
+        CBC_Mode<AES>::Decryption decryption;
+        decryption.SetKeyWithIV((byte*)key.data(), key.size(), iv);
+
+        // Формирование потока дешифрования
+        StreamTransformationFilter stfDecryptor(decryption, new StringSink(decryptedText));
+        stfDecryptor.Put((byte*)cipherText.data() + AES::BLOCKSIZE, cipherText.size() - AES::BLOCKSIZE);
+        stfDecryptor.MessageEnd();
+    }
+    catch (const Exception& e) {
+        std::cerr << "Error during AES decryption: " << e.what() << std::endl;
+    }
+
+    return decryptedText;
+}
+
+QByteArray CryptoUtils::AESEncrypt(const QByteArray &plainText, const std::string &key) {
+    QByteArray cipherText;
+    byte iv[AES::BLOCKSIZE]; // Вектор инициализации
+    AutoSeededRandomPool rng;
+    rng.GenerateBlock(iv, sizeof(iv)); // Генерация случайного IV
+
+    // Шифрование
+    try {
+        // Создание шифра
+        CBC_Mode<AES>::Encryption encryption;
+        encryption.SetKeyWithIV((byte*)key.data(), key.size(), iv);
+
+        // Добавляем IV в начало зашифрованного текста
+        cipherText.append(reinterpret_cast<const char*>(iv), sizeof(iv));
+
+        // Создаем фильтр
+        CryptoPP::ArraySink arraySink((byte*)cipherText.data() + sizeof(iv), cipherText.size() - sizeof(iv));
+        StreamTransformationFilter stfEncryptor(encryption, new Redirector(arraySink));
+        stfEncryptor.Put(reinterpret_cast<const byte*>(plainText.data()), plainText.size());
+        stfEncryptor.MessageEnd();
+    }
+    catch (const CryptoPP::Exception& e) {
+        std::cerr << "Error during AES encryption: " << e.what() << std::endl;
+    }
+
+    return cipherText;
+}
+
+
+
+
+QByteArray CryptoUtils::AESDecrypt(const QByteArray &cipherText, const std::string &key) {
+    QByteArray decryptedText;
+
+    // Извлечение IV из начала зашифрованного текста
+    byte iv[AES::BLOCKSIZE];
+    memcpy(iv, cipherText.data(), AES::BLOCKSIZE);
+
+    try {
+        // Дешифрование
+        CBC_Mode<AES>::Decryption decryption;
+        decryption.SetKeyWithIV((byte*)key.data(), key.size(), iv);
+
+        // Используем ArraySink для записи расшифрованных данных
+        CryptoPP::ArraySink arraySink((byte*)decryptedText.data(), decryptedText.size());
+        StreamTransformationFilter stfDecryptor(decryption, new Redirector(arraySink));
+        stfDecryptor.Put(reinterpret_cast<const byte*>(cipherText.data()) + AES::BLOCKSIZE, cipherText.size() - AES::BLOCKSIZE);
+        stfDecryptor.MessageEnd();
+    }
+    catch (const CryptoPP::Exception& e) {
+        std::cerr << "Error during AES decryption: " << e.what() << std::endl;
+    }
+
+    return decryptedText;
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+std::string CryptoUtils::RSAEncrypt(const std::string &plainText, const RSA::PublicKey &publicKey) {
+    std::string cipherText;
+    AutoSeededRandomPool rng;
+
+    try {
+        RSAES_OAEP_SHA_Encryptor encryptor(publicKey);
+        StringSource ss(plainText, true,
+            new PK_EncryptorFilter(rng, encryptor,
+                new StringSink(cipherText)
+            )
+        );
+    }
+    catch (const Exception &e) {
+        std::cerr << "Error during RSA encryption: " << e.what() << std::endl;
+    }
+
+    return cipherText;
+}
+
+std::string CryptoUtils::RSADecrypt(const std::string &cipherText, const RSA::PrivateKey &privateKey) {
+    std::string recoveredText;
+    AutoSeededRandomPool rng;
+
+    try {
+        RSAES_OAEP_SHA_Decryptor decryptor(privateKey);
+        StringSource ss(cipherText, true,
+            new PK_DecryptorFilter(rng, decryptor,
+                new StringSink(recoveredText)
+            )
+        );
+    }
+    catch (const Exception &e) {
+        std::cerr << "Error during RSA decryption: " << e.what() << std::endl;
+    }
+
+    return recoveredText;
+}
+
+
+// ImageReceiver.cpp
+
+#include "ImageReceiver.h"
+#include "CryptoUtils.h"
+
+ImageReceiver::ImageReceiver(int packetSize, UdpConnection *udpconnection, QWidget *parent)
+: QWidget(parent), packets() {
+    udpConnection = udpconnection;
+    imageTransfer = new ImageTransfer(packetSize);
+
+    // Подключаем сигнал получения данных к слоту
+    connect(udpConnection, &UdpConnection::dataReceived, this, &ImageReceiver::onDataReceived);
+
+    // Создаем метку для отображения изображения
+    imageLabel = new QLabel(this);
+    imageLabel->setScaledContents(true);
+    setWindowTitle("Image Receiver");
+    resize(800, 600);
+}
+
+bool ImageReceiver::initialize(const QString &host, quint16 port) {
+    // Инициализируем UDP-соединение на указанном хосте и порту
+    if (!udpConnection->initialize(host, port)) {
+        qDebug() << "Failed to initialize UDP connection.";
+        return false;
+    }
+    return true;
+}
+
+ImageReceiver::~ImageReceiver() {
+    delete imageTransfer;
+}
+
+void ImageReceiver::onDataReceived(const QByteArray &data) {
+
+    if (data.startsWith("KEY:")) {
+        handleKeyMessage(data);
+        return;
+    }
+
+    if (data.startsWith("TEXT:")) {
+        handleTextMessage(data.mid(5)); // Извлекаем текст, отбрасывая префикс
+        return;
+    }
+
+    if (data.startsWith("PACKET_COUNT:")) {
+        // Обработка сообщения о количестве пакетов
+        bool ok;
+        int expectedPacketCount = data.mid(13).toInt(&ok); // Извлекаем количество пакетов
+        if (ok) {
+            expectedPacketsCount = expectedPacketCount; // Сохраняем ожидаемое количество пакетов
+            qDebug() << "Expecting" << expectedPacketsCount << "packets.";
+        }
+        return;
+    }
+
+    if (data.startsWith("IMAGE:")) {
+        QByteArray imageData = data.mid(6);
+
+        // Проверка контрольной суммы
+        if (verifyCRC(imageData)) {
+            packets.append(imageData);
+            qDebug() << "Received valid image packet of size:" << imageData.size();
+
+            // Если получено достаточное количество пакетов, собираем изображение
+            qDebug() << "Count send packets" << packets.size();
+            qDebug() << "Count send expectedPacketsCount" << expectedPacketsCount;
+
+            if (packets.size() == expectedPacketsCount) {
+                assembleImage();
+            }
+        } else {
+            qDebug() << "Received invalid image packet, CRC check failed.";
+        }
+    }
+}
+
+void ImageReceiver::handleTextMessage(const QByteArray &data) {
+    QString decryptedMessage = QString::fromStdString(CryptoUtils::AESDecrypt(data.toStdString(), "1234567890123456"));
+    emit textMessageReceived(decryptedMessage); // Испускаем сигнал о получении текстового сообщения
+    expectedPacketsCount = 0;
+}
+
+void ImageReceiver::assembleImage() {
+    if (packets.isEmpty()) {
+        qDebug() << "No packets received!";
+        return; // Проверка на наличие пакетов
+    }
+
+    // Собираем данные изображения из пакетов
+    for (const QByteArray &packet : packets) {
+        qDebug() << packet;
+
+        currentImageData.append(packet); // Просто добавляем данные
+
+    }
+
+    // Извлечение контрольной суммы
+//    QByteArray receivedCRC = currentImageData.right(64); // Предполагаем, что контрольная сумма 64 байта
+//    QByteArray encryptedData = currentImageData.left(currentImageData.size() - 64); // Убираем контрольную сумму
+
+
+    // Проверка контрольной суммы
+//    QByteArray calculatedCRC = imageTransfer->calculateCRC(encryptedData);
+//    emit receivedChecksumUpdated (receivedCRC);
+
+//    if (receivedCRC != calculatedCRC) {
+//        qDebug() << "Received invalid image packet, CRC check failed.";
+//        return; // Если контрольная сумма не совпадает, выходим
+//    }
+
+    // Дешифруем данные изображения
+    //QByteArray decryptedData = CryptoUtils::AESDecrypt(encryptedData, "1234567890123456");
+    //QByteArray decryptedData = encryptedData;
+    QByteArray decryptedData = currentImageData;
+
+
+    QByteArray decodedData = QByteArray (decryptedData);
+
+    emit receivedImage (decodedData);
+    // // Создаем изображение из собранных данных
+    // QImage image = QImage::fromData(decodedData, "JPEG");
+    // if (!image.isNull()) {
+    //     imageLabel->setPixmap(QPixmap::fromImage(image));
+    //     imageLabel->resize(image.size());
+    //     imageLabel->show();
+    //     qDebug() << "Image assembled and displayed.";
+    // } else {
+    //     qDebug() << "Failed to assemble image.";
+    // }
+
+    // Очищаем пакеты для следующего изображения
+    packets.clear();
+    currentImageData.clear();
+}
+
+bool ImageReceiver::verifyCRC(const QByteArray &data) {
+    QByteArray receivedData = data.left(data.size() - 64); // Предполагаем, что контрольная сумма 64 байта
+    QByteArray receivedCRC = data.right(64); // Получаем контрольную сумму
+
+    // Вычисляем контрольную сумму для полученных данных
+    QByteArray calculatedCRC = QCryptographicHash::hash(receivedData, QCryptographicHash::Sha256).toHex();
+
+    // Логируем вычисленную контрольную сумму
+    qDebug() << "Calculated Checksum: " << calculatedCRC;
+    return (receivedCRC == calculatedCRC);
+}
+
+
+void ImageReceiver::handleKeyMessage(const QByteArray &data) {
+    std::string key = data.mid(4).toStdString(); // Получаем ключ, отбрасывая префикс "KEY:"
+    emit receivedKey(key); // Испускаем сигнал с ключом
+}
+
+
+
+
+
+
+
+// ImageSender.cpp
+
+#include "ImageSender.h"
+#include "CryptoUtils.h"
+#include "JpegCompressor.h"
+#include <QThread>
+
+
+ImageSender::ImageSender(const QString &host, quint16 port, int packetSize, UdpConnection *udpconnection, QObject *parent)
+  : QObject(parent), currentReceiverIp(host), currentReceiverPort(port) {
+    udpConnection = udpconnection;
+    imageTransfer = new ImageTransfer(packetSize);
+
+    // Инициализируем UDP-соединение
+    if (!udpConnection->initialize(host, port)) {
+        qDebug() << "Failed to initialize UDP connection.";
+    }
+}
+
+ImageSender::~ImageSender() {
+    delete udpConnection;
+    delete imageTransfer;
+}
+
+void ImageSender::sendImage(const QImage &image) {
+    if (image.isNull()) {
+        qDebug() << "Error: Image is null!";
+        return;
+    }
+
+
+    QByteArray encodedImage = JpegCompressor::compress(image);
+    //QByteArray encodedImage = imageTransfer->encodeImageToJPEG(image);
+    qDebug() << "encodedImage" << encodedImage.size();
+
+
+    if (encodedImage.isEmpty()) {
+        qDebug() << "Error: Encoded image is empty!";
+        return;
+    }
+
+    // Шифрование изображения
+    //QByteArray encryptedData = CryptoUtils::AESEncrypt(encodedImage.toStdString(), "1234567890123456").c_str();
+
+    //QByteArray encryptedData = CryptoUtils::AESEncrypt(encodedImage, "1234567890123456");
+    QByteArray encryptedData = encodedImage;
+
+    // Вычисляем контрольную сумму для закодированного изображения
+    QByteArray checksum = imageTransfer->calculateCRC(encodedImage);
+
+    // Разбиваем изображение на пакеты
+    QVector<QByteArray> packets = imageTransfer->splitIntoPackets(encodedImage+checksum);
+
+    // Отправляем количество пакетов
+    QByteArray packetCountMessage = "PACKET_COUNT:" + QByteArray::number(packets.size());
+    udpConnection->sendData(packetCountMessage);
+    qDebug() << packets.size() << "количество пакетов";
+
+
+    for (const QByteArray &packet : packets) {
+        QByteArray packetWithPrefix = "IMAGE:" + packet;
+        udpConnection->sendData(packetWithPrefix);
+        QThread::sleep(1); // Задержка в 1 секунду между отправками
+    }
+
+    qDebug() << "Image sent successfully.";
+}
+
+void ImageSender::sendTextMessage(const QString &message) {
+    // Шифруем сообщение
+    std::string encryptedMessage = CryptoUtils::AESEncrypt(message.toStdString(), "1234567890123456");
+
+    // Создаем QByteArray из зашифрованного сообщения с префиксом
+    QByteArray messageToSend = "TEXT:" + QByteArray::fromStdString(encryptedMessage);
+
+    // Отправляем зашифрованное сообщение через UDP
+    udpConnection->sendData(messageToSend);
+}
+
+void ImageSender::sendKey(const std::string &key) {
+    QByteArray keyMessage = "KEY:" + QByteArray::fromStdString(key);
+    udpConnection->sendData(keyMessage);
+}
+
+
+
+
+// ImageTransfer.cpp
+
+#include "ImageTransfer.h"
+#include <QBuffer>
+
+ImageTransfer::ImageTransfer(int packetSize) : packetSize(packetSize) {}
+
+QByteArray ImageTransfer::encodeImageToJPEG(const QImage &image) {
+    QByteArray byteArray;
+    QBuffer buffer(&byteArray);
+    buffer.open(QIODevice::WriteOnly);
+    if (image.save(&buffer, "JPEG")) {
+        qDebug() << "Image encoded to JPEG successfully.";
+    } else {
+        qDebug() << "Failed to encode image to JPEG.";
+    }
+    return byteArray;
+}
+
+QVector<QByteArray> ImageTransfer::splitIntoPackets(const QByteArray &data) {
+    QVector<QByteArray> packets;
+    int totalSize = data.size();
+    int offset = 0;
+
+    while (offset < totalSize) {
+        int size = qMin(packetSize, totalSize - offset);
+        QByteArray packet = data.mid(offset, size);
+        QByteArray crc = calculateCRC(packet);
+        packet.append(crc); // Добавляем контрольную сумму к пакету
+        //qDebug() << "СalculateCRC packet" << crc;
+        packets.append(packet);
+        offset += size;
+    }
+
+    qDebug() << "Data split into" << packets.size() << "packets.";
+    return packets;
+}
+
+QByteArray ImageTransfer::calculateCRC(const QByteArray &data) {
+    QByteArray crc = QCryptographicHash::hash(data, QCryptographicHash::Sha256).toHex();
+    return crc;
+}
+
+
+
+
+
+
+#include "JpegCompressor.h"
+#include <QDebug>
+
+QByteArray JpegCompressor::compress(const QImage &image) {
+    QByteArray byteArray;
+    int width = image.width();
+    int height = image.height();
+    int numChannels = 3; // RGB
+
+    // Выделяем буфер для изображения
+    uint8_t *imageData = new uint8_t[width * height * numChannels];
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            QColor color = image.pixelColor(x, y);
+            imageData[(y * width + x) * numChannels + 0] = color.red();
+            imageData[(y * width + x) * numChannels + 1] = color.green();
+            imageData[(y * width + x) * numChannels + 2] = color.blue();
+        }
+    }
+
+    // Подготовка буфера для сжатого изображения
+    int jpegSize = width * height * numChannels; // Предполагаем, что сжатое изображение не будет больше исходного
+    byteArray.resize(jpegSize); // Устанавливаем размер буфера
+
+    jpge::params compressionParams;
+    compressionParams.m_quality = 90; // Установите качество сжатия
+
+    // Сжимаем изображение в JPEG
+    if (!jpge::compress_image_to_jpeg_file_in_memory(byteArray.data(), jpegSize, width, height, numChannels, imageData, compressionParams)) {
+        qDebug() << "JPEG compression failed!";
+        delete[] imageData;
+        return QByteArray(); // Возвращаем пустой QByteArray в случае ошибки
+    }
+
+    delete[] imageData;
+    byteArray.resize(jpegSize); // Устанавливаем фактический размер сжатого изображения
+    return byteArray;
+}
+
+
+QImage JpegCompressor::decompress(const QByteArray &data) {
+    int width, height, actualComps;
+    unsigned char *decompressedData = jpgd::decompress_jpeg_image_from_memory(reinterpret_cast<const unsigned char*>(data.data()), data.size(), &width, &height, &actualComps, 3);
+
+    if (!decompressedData) {
+        qDebug() << "JPEG decompression failed!";
+        return QImage(); // Возвращаем пустое изображение в случае ошибки
+    }
+
+    QImage image(width, height, QImage::Format_RGB888);
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            int index = (y * width + x) * 3;
+            QColor color(decompressedData[index], decompressedData[index + 1], decompressedData[index + 2]);
+            image.setPixelColor(x, y, color);
+        }
+    }
+
+    free(decompressedData);
+    return image;
+}
+
+
+
+// main.cpp
+
+#include <QApplication>
+#include "MainWindow.h"
+
+int main(int argc, char *argv[]) {
+    QApplication app(argc, argv);
+
+    MainWindow mainWindow;
+    mainWindow.show();
+
+    return app.exec();
+}
+
+
+// MainWindow.cpp
+
+#include "MainWindow.h"
+#include <QHostInfo>
+#include <QNetworkInterface>
+#include <QStyleFactory>
+#include <QClipboard>
+#include <QApplication>
+#include <QFormLayout>
+#include <QVBoxLayout>
+#include <QHBoxLayout>
+#include <QGridLayout>
+#include <QMessageBox>
+#include "CryptoUtils.h"
+#include "JpegCompressor.h"
+
+
+MainWindow::MainWindow(QWidget *parent)
+    : QMainWindow(parent), udpSocket(new QUdpSocket(this)) {
+    // Устанавливаем стиль приложения
+    setStyle(QStyleFactory::create("Fusion"));
+
+    // Создаем центральный виджет и устанавливаем компоновку
+    QWidget *centralWidget = new QWidget(this);
+    QGridLayout *mainLayout = new QGridLayout(centralWidget);
+    mainLayout->setSpacing(10);
+    mainLayout->setContentsMargins(10, 10, 10, 10);
+
+    // Группа для ввода данных получателя
+    QGroupBox *receiverGroup = new QGroupBox("Receiver Information", this);
+    QVBoxLayout *receiverLayout = new QVBoxLayout(receiverGroup);
+
+    // Поле для ввода IP-адреса получателя
+    QLabel *receiverIpLabel = new QLabel("Receiver IP:", this);
+    receiverIpLineEdit = new QLineEdit(this);
+    receiverLayout->addWidget(receiverIpLabel);
+    receiverLayout->addWidget(receiverIpLineEdit);
+
+    // Поле для ввода порта получателя
+    QLabel *receiverPortLabel = new QLabel("Receiver Port:", this);
+    receiverPortLineEdit = new QLineEdit(this);
+    receiverPortLineEdit->setPlaceholderText("Enter receiver port");
+    receiverLayout->addWidget(receiverPortLabel);
+    receiverLayout->addWidget(receiverPortLineEdit);
+
+    mainLayout->addWidget(receiverGroup, 0, 0, 1, 2); // Добавляем группу в первую строку
+
+    // Группа для ввода своего порта
+    QGroupBox *localPortGroup = new QGroupBox("Local Port", this);
+    QVBoxLayout *localPortLayout = new QVBoxLayout(localPortGroup);
+
+    QLabel *localPortLabel = new QLabel("Your Port:", this);
+    portLineEdit = new QLineEdit(this);
+    portLineEdit->setPlaceholderText("Enter your port");
+    localPortLayout->addWidget(localPortLabel);
+    localPortLayout->addWidget(portLineEdit);
+
+    QPushButton *bindPortButton = new QPushButton("Bind Port", this);
+    localPortLayout->addWidget(bindPortButton);
+    mainLayout->addWidget(localPortGroup, 1, 0, 1, 2); // Добавляем группу в следующую строку
+
+    // Подключаем сигнал для кнопки биндинга порта
+    connect(bindPortButton, &QPushButton::clicked, this, &MainWindow::bindPort);
+
+    // Кнопка для установления соединения
+    connectButton = new QPushButton("Establish Connection", this);
+    mainLayout->addWidget(connectButton, 2, 0); // Кнопка занимает одну ячейку
+    connect(connectButton, &QPushButton::clicked, this, &MainWindow::establishConnection);
+
+    // Кнопка для выбора изображения
+    QPushButton *selectImageButton = new QPushButton("Select Image", this);
+    mainLayout->addWidget(selectImageButton, 2, 1); // Кнопка занимает одну ячейку
+    connect(selectImageButton, &QPushButton::clicked, this, &MainWindow::selectImage);
+
+    // Поле для ввода текстового сообщения
+    QLabel *messageLabel = new QLabel("Message:", this);
+    mainLayout->addWidget(messageLabel, 3, 0); // Метка занимает одну ячейку
+    messageInput = new QLineEdit(this);
+    mainLayout->addWidget(messageInput, 3, 1); // Поле для ввода в той же строке
+
+    // Кнопка для отправки текстового сообщения
+    QPushButton *sendMessageButton = new QPushButton("Send Message", this);
+    mainLayout->addWidget(sendMessageButton, 4, 1); // Кнопка занимает одну ячейку
+    connect(sendMessageButton, &QPushButton::clicked, this, &MainWindow::sendMessage);
+
+    // Метка для отображения статуса
+    statusLabel = new QLabel("Status: Ready", this);
+    mainLayout->addWidget(statusLabel, 5, 0, 1, 2); // Статус занимает две ячейки
+
+    // Метка для отображения статуса UDP-сокета
+    udpStatusLabel = new QLabel("UDP Socket Status: Not Connected", this);
+    mainLayout->addWidget(udpStatusLabel, 6, 0, 1, 2); // Статус UDP-сокета занимает две ячейки
+
+    // Метка для отображения отправленного изображения
+    sentImageLabel = new QLabel("Sent Image: None", this);
+    mainLayout->addWidget(sentImageLabel, 7, 0); // Метка занимает одну ячейку
+    sentImageDisplay = new QLabel(this);
+    sentImageDisplay->setScaledContents(true);
+    sentImageDisplay->setFixedSize(150, 150); // Установите размер для отображения
+    mainLayout->addWidget(sentImageDisplay, 7, 1); // Отображение занимает одну ячейку
+
+    // Метка для отображения полученного изображения
+    receivedImageLabel = new QLabel("Received Image: None", this);
+    mainLayout->addWidget(receivedImageLabel, 8, 0); // Метка занимает одну ячейку
+    receivedImageDisplay = new QLabel(this);
+    receivedImageDisplay->setScaledContents(true);
+    receivedImageDisplay->setFixedSize(150, 150); // Установите размер для отображения
+    mainLayout->addWidget(receivedImageDisplay, 8, 1); // Отображение занимает одну ячейку
+
+    // Получение локального IP-адреса
+    foreach (const QHostAddress &address, QNetworkInterface::allAddresses()) {
+        if (address != QHostAddress::LocalHost && address.toIPv4Address() != 0) {
+            localIP = address.toString();
+            break; // Выходим из цикла, как только нашли подходящий адрес
+        }
+    }
+
+    // Метка для отображения локального IP-адреса
+    localIpLabel = new QLabel("Local IP: " + localIP, this);
+    mainLayout->addWidget(localIpLabel, 9, 0, 1, 2); // Метка занимает две ячейки
+
+    // Поле для отображения полученных текстовых сообщений
+    receivedMessages = new QTextEdit(this);
+    receivedMessages->setReadOnly(true); // Делаем поле только для чтения
+    mainLayout->addWidget(receivedMessages, 10, 0, 1, 2); // Поле занимает две ячейки
+
+    // Метки для отображения контрольных сумм
+    sentChecksumLabel = new QLabel("Sent Checksum: None", this);
+    mainLayout->addWidget(sentChecksumLabel, 11, 0); // Метка занимает одну ячейку
+    receivedChecksumLabel = new QLabel("Received Checksum: None", this);
+    mainLayout->addWidget(receivedChecksumLabel, 11, 1); // Метка занимает одну ячейку
+
+    // Кнопка для копирования IP
+    QPushButton *copyIpButton = new QPushButton("Copy Local IP", this);
+    mainLayout->addWidget(copyIpButton, 12, 0, 1, 2); // Добавляем кнопку для копирования IP
+    connect(copyIpButton, &QPushButton::clicked, this, &MainWindow::copyIpToClipboard);
+
+    // Устанавливаем центральный виджет
+    setCentralWidget(centralWidget);
+    setWindowTitle("UDP Image and Message Sender and Receiver");
+}
+
+MainWindow::~MainWindow() {
+    delete imageSender;
+    delete imageReceiver;
+}
+
+void MainWindow::bindPort() {
+    quint16 localPort = portLineEdit->text().toUInt();
+    if (localPort == 0) {
+        statusLabel->setText("Error: Please enter a valid local port.");
+        return;
+    }
+
+    if (isPortBound) {
+        statusLabel->setText("Port is already bound.");
+        return; // Если порт уже связан, выходим
+    }
+
+    // Инициализация UDP-сокета и привязка к указанному порту
+    if (udpSocket->bind(QHostAddress::Any, localPort)) {
+        udpStatusLabel->setText("UDP Socket Status: Listening on port " + QString::number(localPort));
+        //connect(udpSocket, &QUdpSocket::readyRead, this, &MainWindow::readPendingDatagrams);
+        isPortBound = true; // Устанавливаем флаг после успешного биндинга
+        udpConnection = new UdpConnection(udpSocket);
+        udpConnection->initialize(localIP, localPort);
+
+    } else {
+        statusLabel->setText("Error: Unable to bind to port " + QString::number(localPort) + ": " + udpSocket->errorString());
+    }
+}
+
+void MainWindow::sendMessage() {
+    QString message = messageInput->text();
+    if (!message.isEmpty()) {
+        imageSender->sendTextMessage(message); // Отправляем текстовое сообщение
+        statusLabel->setText("Status: Message sent.");
+        messageInput->clear(); // Очищаем поле ввода
+    } else {
+        statusLabel->setText("Status: Message is empty."); // Уведомляем, если сообщение пустое
+    }
+}
+
+void MainWindow::onImageReceived(const QByteArray &data) {
+    // qDebug() << "Received data size:" << data.size();
+    // statusLabel->setText("Status: Image received.");
+
+    // // Получаем контрольную сумму
+    // QByteArray receivedChecksum = data.right(64); // Предполагаем, что контрольная сумма 64 байта
+    // receivedChecksumLabel->setText("Received Checksum: " + receivedChecksum.toHex()); // Обновляем метку
+
+    // // Здесь вы должны обработать данные и создать изображение
+    // QByteArray imageData = data.left(data.size() - 64); // Убираем контрольную сумму
+
+    QImage image = JpegCompressor::decompress(data);
+    if (!image.isNull()) {
+        receivedImageLabel->setText("Received Image: Image Data"); // Обновляем метку
+        receivedImageDisplay->setPixmap(QPixmap::fromImage(image)); // Отображаем полученное изображение
+    } else {
+        receivedImageLabel->setText("Received Image: Failed to load.");
+    }
+}
+
+void MainWindow::copyIpToClipboard() {
+    QClipboard *clipboard = QApplication::clipboard();
+    clipboard->setText(localIpLabel->text().split("Local IP: ").last());
+    statusLabel->setText("Local IP copied to clipboard!");
+}
+
+void MainWindow::readPendingDatagrams() {
+    // while (udpSocket->hasPendingDatagrams()) {
+    //     QByteArray datagram;
+    //     datagram.resize(udpSocket->pendingDatagramSize());
+    //     QHostAddress sender;
+    //     quint16 senderPort;
+
+    //     udpSocket->readDatagram(datagram.data(), datagram.size(), &sender, &senderPort);
+    //     qDebug() << "Received datagram from" << sender.toString() << ":" << senderPort << "Data:" << datagram;
+
+
+
+//        // Обработка полученных данных
+//        if (datagram.startsWith("KEY:")) {
+//            // Обработка ключа
+//            emit onTextMessageReceived("Received Key: " + QString(datagram));
+//        } else if (datagram.startsWith("TEXT:")) {
+//            // Обработка тёекстового сообщения
+//            emit onTextMessageReceived(QString(datagram));
+//        } else if (datagram.startsWith("IMAGE:")) {
+//            // Обработка изображения
+//            emit onImageReceived(datagram);
+//        } else {
+//            qDebug() << "Unknown data type received.";
+//        }
+    //}
+}
+
+
+void MainWindow::establishConnection() {
+    QString receiverIp = receiverIpLineEdit->text();
+    quint16 receiverPort = receiverPortLineEdit->text().toUInt();
+
+    // Проверка на корректность введенного IP и порта
+    if (receiverIp.isEmpty() || receiverPort == 0) {
+        statusLabel->setText("Error: Please enter a valid IP and port.");
+        return;
+    }
+
+    // Генерация ключей RSA
+    std::string publicKey, privateKey;
+    CryptoUtils::GenerateRSAKeys(publicKey, privateKey);
+
+    // Создаем объекты после успешной привязки
+    imageReceiver = new ImageReceiver(1024, udpConnection, this);
+    imageSender = new ImageSender(receiverIp, receiverPort, 1024,udpConnection, this);
+
+    // Отправляем публичный ключ
+    imageSender->sendKey(publicKey);
+
+
+    connect(imageReceiver, &ImageReceiver::textMessageReceived, this, &MainWindow::onTextMessageReceived);
+    connect(imageReceiver, &ImageReceiver::receivedImage, this, &MainWindow::onImageReceived);
+
+
+    // Подключаем сигналы после инициализации
+    connect(imageSender, &ImageSender::sentChecksumUpdated, this, [this](const QByteArray &checksum) {
+        sentChecksumLabel->setText("Sent Checksum: " + checksum.toHex());
+    });
+
+    connect(imageReceiver, &ImageReceiver::receivedChecksumUpdated, this, [this](const QByteArray &checksum) {
+        receivedChecksumLabel->setText("Received Checksum: " + checksum.toHex());
+    });
+
+    statusLabel->setText("Connection established with " + receiverIp + ":" + QString::number(receiverPort));
+}
+
+void MainWindow::selectImage() {
+    QString fileName = QFileDialog::getOpenFileName(this, "Open Image", "", "Images (*.png *.jpg *.jpeg *.bmp)");
+    if (!fileName.isEmpty()) {
+        QImage image(fileName);
+        if (!image.isNull()) {
+            sentImageLabel->setText("Sent Image: " + fileName); // Обновляем метку
+            sentImageDisplay->setPixmap(QPixmap::fromImage(image)); // Отображаем отправленное изображение
+            statusLabel->setText("Status: Sending image...");
+            imageSender->sendImage(image); // Отправляем изображение
+        } else {
+            statusLabel->setText("Status: Failed to load image.");
+        }
+    }
+}
+
+// Метод для обработки текстовых сообщений
+void MainWindow::onTextMessageReceived(const QString &message) {
+    statusLabel->setText("Received Message: " + message); // Обновляем статус с текстом сообщения
+    receivedMessages->append("Received: " + message); // Добавляем полученное сообщение в текстовое поле
+}
+
+//10.128.18.45
+
+
+// UdpConnection.cpp
+
+#include "UdpConnection.h"
+
+UdpConnection::UdpConnection(QUdpSocket *UdpSocket, QObject *parent) : QObject(parent) {
+    udpSocket = UdpSocket;
+    connect(udpSocket, &QUdpSocket::readyRead, this, &UdpConnection::onReadyRead);
+}
+
+UdpConnection::~UdpConnection() {
+    delete udpSocket;
+}
+
+bool UdpConnection::initialize(const QString &host, quint16 port) {
+    remoteHost = QHostAddress(host);
+    remotePort = port;
+
+    // // Проверяем состояние сокета перед привязкой
+    // if (udpSocket->state() == QAbstractSocket::BoundState) {
+    //     qDebug() << "Socket is already bound. Closing the socket.";
+    //     udpSocket->close(); // Закрываем старый сокет
+    // }
+
+    // // Привязываем сокет к локальному порту
+    // if (!udpSocket->bind(QHostAddress::Any, port, QUdpSocket::ReuseAddressHint)) {
+    //     qDebug() << "Failed to bind UDP socket:" << udpSocket->errorString();
+    //     return false;
+    // }
+
+    // qDebug() << "Initialized UDP connection to" << remoteHost.toString() << ":" << remotePort;
+    return true;
+}
+
+
+
+
+
+void UdpConnection::sendData(const QByteArray &data) {
+    if (udpSocket->writeDatagram(data, remoteHost, remotePort) == -1) {
+        qDebug() << "Failed to send data:" << udpSocket->errorString();
+        return; // Добавьте возврат, чтобы избежать дальнейших действий
+    }
+    qDebug() << "Data sent:" << data;
+}
+
+
+void UdpConnection::onReadyRead() {
+    while (udpSocket->hasPendingDatagrams()) {
+        QByteArray buffer;
+        buffer.resize(udpSocket->pendingDatagramSize());
+        QHostAddress sender;
+        quint16 senderPort;
+
+        udpSocket->readDatagram(buffer.data(), buffer.size(), &sender, &senderPort);
+        qDebug() << "Data received from" << sender.toString() << ":" << senderPort << "Data:" << buffer;
+
+        emit dataReceived(buffer); // Генерируем сигнал о получении данных
+    }
+}
+
+
+QByteArray UdpConnection::receiveData() {
+    // Здесь мы можем использовать сигнал dataReceived, чтобы вернуть данные
+    QByteArray buffer;
+    if (udpSocket->hasPendingDatagrams()) {
+        buffer.resize(udpSocket->pendingDatagramSize());
+        QHostAddress sender;
+        quint16 senderPort;
+        udpSocket->readDatagram(buffer.data(), buffer.size(), &sender, &senderPort);
+    }
+    return buffer; // Возвращаем полученные данные
+}
+
+
+// CryptoUtils.h
+
+#ifndef CRYPTOUTILS_H
+#define CRYPTOUTILS_H
+
+#include <cryptlib.h>
+#include <osrng.h>
+#include <rsa.h>
+#include <aes.h>
+#include <modes.h>
+#include <filters.h>
+#include <hex.h>
+#include <string>
+#include <QByteArray>
+
+class CryptoUtils {
+public:
+    // Генерация RSA ключей
+    static void GenerateRSAKeys(std::string &publicKey, std::string &privateKey);
+
+    // Шифрование данных с помощью AES
+    static std::string AESEncrypt(const std::string &plainText, const std::string &key);
+
+    // Дешифрование данных с помощью AES
+    static std::string AESDecrypt(const std::string &cipherText, const std::string &key);
+
+    // Шифрование данных с помощью AES
+    static QByteArray AESEncrypt(const QByteArray &plainText, const std::string &key);
+
+    // Дешифрование данных с помощью AES
+    static QByteArray AESDecrypt(const QByteArray &plainText, const std::string &key);
+
+    // Шифрование данных с помощью RSA
+    static std::string RSAEncrypt(const std::string &plainText, const CryptoPP::RSA::PublicKey &publicKey);
+
+    // Дешифрование данных с помощью RSA
+    static std::string RSADecrypt(const std::string &cipherText, const CryptoPP::RSA::PrivateKey &privateKey);
+};
+
+#endif // CRYPTOUTILS_H
+
+
+// ImageReceiver.h
+
+#ifndef IMAGERECEIVER_H
+#define IMAGERECEIVER_H
+
+#include "UdpConnection.h"
+#include "ImageTransfer.h"
+#include <QImage>
+#include <QVector>
+#include <QByteArray>
+#include <QWidget>
+#include <QLabel>
+#include <QCryptographicHash>
+#include <rsa.h>
+
+class ImageReceiver : public QWidget {
+    Q_OBJECT
+
+public:
+    ImageReceiver(int packetSize, UdpConnection *udpconnection, QWidget *parent = nullptr);
+    ~ImageReceiver();
+    bool initialize(const QString &host, quint16 port);
+
+signals:
+    void dataReceived(const QByteArray &data);
+    void textMessageReceived(const QString &message);
+    void receivedChecksumUpdated(const QByteArray &checksum);
+    void receivedKey(const std::string &key); // Новый сигнал для получения ключа
+    void receivedImage(const QByteArray &data); // Новый сигнал для получения ключа
+
+private slots:
+
+public slots:
+    void onDataReceived(const QByteArray &data);
+
+
+private:
+    UdpConnection *udpConnection;
+    ImageTransfer *imageTransfer;
+    QVector<QByteArray> packets;
+    QLabel *imageLabel;
+    QByteArray currentImageData;
+
+    void assembleImage();
+    bool verifyCRC(const QByteArray &data);
+    void handleTextMessage(const QByteArray &data);
+    void handleKeyMessage(const QByteArray &data); // Новый метод для обработки ключа
+    int expectedPacketsCount = 0; // Ожидаемое количество пакетов
+};
+
+#endif // IMAGERECEIVER_H
+
+
+// ImageSender.h
+
+#ifndef IMAGESENDER_H
+#define IMAGESENDER_H
+
+#include "UdpConnection.h"
+#include "ImageTransfer.h"
+#include <QImage>
+#include <QString>
+
+
+class ImageSender : public QObject {
+    Q_OBJECT
+
+public:
+    ImageSender(const QString &host, quint16 port, int packetSize, UdpConnection *udpconnection, QObject *parent = nullptr);
+    ~ImageSender();
+
+    void sendImage(const QImage &image);
+    void sendTextMessage(const QString &message);
+    void sendKey(const std::string &key); // Новый метод для отправки ключа
+
+
+private:
+    UdpConnection *udpConnection;
+    ImageTransfer *imageTransfer;
+    QString currentReceiverIp;
+    quint16 currentReceiverPort;
+
+signals:
+    void sentChecksumUpdated(const QByteArray &checksum);
+};
+
+#endif // IMAGESENDER_H
+
+
+
+// ImageTransfer.h
+
+#ifndef IMAGETRANSFER_H
+#define IMAGETRANSFER_H
+
+#include <QImage>
+#include <QByteArray>
+#include <QVector>
+#include <QCryptographicHash>
+#include <QDebug>
+
+class ImageTransfer {
+public:
+    ImageTransfer(int packetSize);
+
+    // Метод для кодирования изображения в JPEG
+    QByteArray encodeImageToJPEG(const QImage &image);
+
+    // Метод для разбиения закодированного изображения на пакеты
+    QVector<QByteArray> splitIntoPackets(const QByteArray &data);
+
+    // Метод для вычисления контрольной суммы CRC
+    QByteArray calculateCRC(const QByteArray &data);
+
+private:
+    int packetSize; // Размер пакета
+};
+
+#endif // IMAGETRANSFER_H
+
+
+
+#ifndef JPEGCOMPRESSOR_H
+#define JPEGCOMPRESSOR_H
+
+#include <QImage>
+#include <QByteArray>
+#include <jpeg/jpge.h>
+#include <jpeg/jpgd.h>
+
+class JpegCompressor {
+public:
+    static QByteArray compress(const QImage &image);
+    static QImage decompress(const QByteArray &data);
+};
+
+#endif // JPEGCOMPRESSOR_H
+
+
+// MainWindow.h
+
+#ifndef MAINWINDOW_H
+#define MAINWINDOW_H
+
+#include <QMainWindow>
+#include <QImage>
+#include <QPushButton>
+#include <QVBoxLayout>
+#include <QFileDialog>
+#include <QLabel>
+#include <QLineEdit>
+#include <QGroupBox>
+#include <QTextEdit>
+#include <QUdpSocket>
+#include "ImageSender.h"
+#include "ImageReceiver.h"
+#include "UdpConnection.h"
+#include "JpegCompressor.h"
+
+class MainWindow : public QMainWindow {
+    Q_OBJECT
+
+public:
+    MainWindow(QWidget *parent = nullptr);
+    ~MainWindow();
+
+private slots:
+    void bindPort();  // Объявление метода bindPort
+    void selectImage(); // Слот для выбора изображения
+    void sendMessage(); // Слот для отправки текстового сообщения
+    void onImageReceived(const QByteArray &data); // Слот для обработки полученного изображения
+    void onTextMessageReceived(const QString &message); // Слот для обработки текстовых сообщений
+    void copyIpToClipboard(); // Слот для копирования IP-адреса в буфер обмена
+    void establishConnection(); // Слот для установления соединения
+    void readPendingDatagrams(); // Слот для обработки входящих сообщений
+
+private:
+    UdpConnection *udpConnection;
+    QString localIP;
+    QUdpSocket *udpSocket; // UDP сокет для связи
+    ImageSender *imageSender = nullptr; // Указатель на объект ImageSender
+    ImageReceiver *imageReceiver = nullptr; // Указатель на объект ImageReceiver
+    QLabel *statusLabel; // Метка для отображения статуса
+    QLabel *sentImageLabel; // Метка для отображения отправленного изображения
+    QLabel *receivedImageLabel; // Метка для отображения полученного изображения
+    QLabel *localIpLabel; // Метка для отображения локального IP-адреса
+    QLineEdit *messageInput; // Поле для ввода текстового сообщения
+    QLineEdit *portLineEdit; // Поле для ввода своего порта
+    QLineEdit *receiverIpLineEdit; // Поле для ввода IP получателя
+    QLineEdit *receiverPortLineEdit; // Поле для ввода порта получателя
+    QLabel *udpStatusLabel; // Метка для отображения статуса UDP-сокета
+    QPushButton *connectButton; // Кнопка для установления соединения
+    QLabel *sentImageDisplay; // QLabel для отображения отправленного изображения
+    QLabel *receivedImageDisplay; // QLabel для отображения полученного изображения
+    QTextEdit *receivedMessages; // Поле для отображения полученных текстовых сообщений
+    QLabel *sentChecksumLabel; // Метка для отображения отправленных контрольных сумм
+    QLabel *receivedChecksumLabel; // Метка для отображения полученных контрольных сумм
+
+    bool isPortBound = false; // Флаг для отслеживания состояния биндинга порта
+};
+
+#endif // MAINWINDOW_H
+
+
+// RsaEncryption.h
+
+#ifndef RSAENCRYPTION_H
+#define RSAENCRYPTION_H
+
+#include <QByteArray>
+#include <QCryptographicHash>
+#include <QDebug>
+#include <QFile>
+#include <QFileInfo>
+#include <QtCrypto>
+
+class RsaEncryption {
+public:
+    RsaEncryption();
+    ~RsaEncryption();
+
+    // Генерация пары ключей
+    void generateKeys(int keySize);
+
+    // Шифрование данных
+    QByteArray encrypt(const QByteArray &data, const QString &publicKeyFile);
+
+    // Дешифрование данных
+    QByteArray decrypt(const QByteArray &data, const QString &privateKeyFile);
+
+private:
+    QString publicKey;
+    QString privateKey;
+};
+
+#endif // RSAENCRYPTION_H
+
+
+// UdpConnection.h
+
+#ifndef UDPCONNECTION_H
+#define UDPCONNECTION_H
+
+#include <QUdpSocket>
+#include <QObject>
+#include <QHostAddress>
+#include <QByteArray>
+#include <QDebug>
+
+class UdpConnection : public QObject {
+    Q_OBJECT
+
+public:
+    UdpConnection(QUdpSocket *udpSocket, QObject *parent = nullptr);
+    ~UdpConnection();
+
+    // Метод для инициализации соединения
+    bool initialize(const QString &host, quint16 port);
+
+    // Метод для отправки данных
+    void sendData(const QByteArray &data);
+
+    // Метод для получения данных
+    QByteArray receiveData();
+
+signals:
+    void dataReceived(const QByteArray &data);
+
+private slots:
+    void onReadyRead();
+
+private:
+    QUdpSocket *udpSocket; // Сокет для работы с UDP
+    QHostAddress remoteHost; // Хост для отправки данных
+    quint16 remotePort; // Порт для отправки данных
+};
+
+#endif // UDPCONNECTION_H
+
+
+<?xml version="1.0" encoding="UTF-8"?>
+<ui version="4.0">
+ <class>MainWindow</class>
+ <widget class="QMainWindow" name="MainWindow">
+  <property name="geometry">
+   <rect>
+    <x>0</x>
+    <y>0</y>
+    <width>800</width>
+    <height>600</height>
+   </rect>
+  </property>
+  <property name="windowTitle">
+   <string>MainWindow</string>
+  </property>
+  <widget class="QWidget" name="centralwidget"/>
+  <widget class="QMenuBar" name="menubar"/>
+  <widget class="QStatusBar" name="statusbar"/>
+ </widget>
+ <resources/>
+ <connections/>
+</ui>
+
+
